@@ -621,97 +621,21 @@ df <- read_csv("csv_outputs/NFS_diets_MiFish_ASVtable.csv") %>%
   rename(sample = `...1`)
 
 # reformat
+# dealing with the positive and negative controls having a different pattern
 sample_df <- df %>%
   pivot_longer(2:length(df), names_to = "ASV", values_to = "reads") %>%
   filter(reads > 0) %>%
-  separate(sample, into = c("ablg", "replicate"), remove = F)
+  separate(
+    sample,
+    into = c("ablg", "replicate"),
+    sep = "-(?=[^-]+$)",
+    remove = FALSE
+  )
 
 head(sample_df)
 ```
-
-stuff in the extraction blanks?
-```{r closer-look-at-extraction-blanks}
-sample_df %>%
-  filter(reads > 0) %>%
-  filter(str_detect(sample, "NFS")) %>%
-  separate(sample, into = c("id", "plate", "type", "rep")) %>%
-  select(-ablg, -replicate) %>%
-  left_join(., collapsed_taxonomy, by = "ASV") %>%
-  ggplot(aes(x = id, y = reads, fill = reorder(taxon, -reads))) +
-  geom_bar(stat = "identity") +
-  facet_grid(rows = vars(rep), cols = vars(type), space = "free", scales = "free") +
-  theme_bw() +
-  theme(
-    legend.position = "right",
-    axis.text.x = element_text(angle = 90)
-  )
-
-```
-
-```{r reads-in-the-controls}
-sample_df %>%
-  filter(reads > 0) %>%
-  filter(str_detect(sample, "NFS")) %>%
-  separate(sample, into = c("id", "plate", "type", "rep")) %>%
-  select(-ablg, -replicate) %>%
-  left_join(., collapsed_taxonomy, by = "ASV") %>%
-  filter(!is.na(taxon)) %>%
-  select(taxon, reads) %>%
-  group_by(taxon) %>%
-  
-
-```
-
-
-
-```{r}
-sample_df %>%
-  filter(reads > 0) %>%
-  filter(!str_detect(sample, "NFS")) %>%
-  #separate(sample, into = c("id", "plate", "type", "rep")) %>%
-  #select(-ablg, -replicate) %>%
-  left_join(., collapsed_taxonomy, by = "ASV") %>%
-   filter(taxon != "Callorhinus ursinus") %>%
-  ggplot(aes(x = ablg, y = reads, fill = reorder(taxon, -reads))) +
-  geom_bar(stat = "identity") +
-  facet_grid(rows = vars(replicate), space = "free", scales = "free") +
-  theme_bw() +
-  theme(
-    legend.position = "none",
-    axis.text.x = element_text(angle = 90)
-  )
-```
-
-
-```{r}
-# which species are found in the most samples?
-sample_df %>%
-  filter(!str_detect(sample, "NFS")) %>%
-  left_join(., collapsed_taxonomy, by = "ASV") %>%
-  filter(reads > 100, !is.na(taxon)) %>%
-  filter(taxon != "Callorhinus ursinus") %>%
-  filter(taxonomic_level %in% c("species", "genus")) %>%
-  group_by(ablg, replicate, taxon) %>%
-  mutate(taxon_reads = sum(reads)) %>%
-  select(-ASV, -reads) %>%
-  unique() %>%
-  group_by(ablg, taxon) %>%
-  tally() %>%
-  group_by(taxon) %>%
-  tally() %>%
-  arrange(desc(n))
-```
-
-```{r}
-# how many total samples?
-sample_df %>%
-  select(ablg) %>%
-  unique()
-```
-188 ablg numbers (do all of these correspond to samples from the field?)
-
 ```{r pull-in-metadata}
-meta <- read_csv("../data/NFS_diets_metadata_20261005.csv")
+meta <- read_csv("../metadata/NFS_diets_metadata_20261005.csv")
 
 # add metadata to the sample
 sample_df_w_meta <- sample_df %>%
@@ -726,109 +650,382 @@ sample_df_w_meta %>%
   unique()
 
 ```
-120 total samples from 2025.
 
-```{r}
-df_for_prelim <- sample_df_w_meta %>%
-  filter(sample_type == "sample") %>%
-  filter(collection_year == "2025") %>%
-  filter(!is.na(taxon)) %>%
-  filter(ablg != "NFS") 
+# account for likely contaminants 
+
+- tag-jumping
+- negative PCR controls
+- field negatives
 
 
-df_for_prelim %>%
-  filter(taxon != "Callorhinus ursinus") %>%
-  ggplot(aes(x = ablg, y = reads, fill = reorder(taxon, -reads))) +
+## Step 1. Account for tag-jumping by using the positive controls 
+
+subtract the proportion of reads that jumped into the positive control samples from each environmental sample 
+
+```{r tag-jumping-by-ASVs-in-PC}
+# on a per-plate basis, what % of each ASV should be subtracted from the samples?
+asv_prop_df <- sample_df %>%
+  group_by(sample) %>%
+  mutate(total_reads = sum(reads)) %>%
+  mutate(asv_prop = reads/total_reads)
+  
+asv_prop_df %>%
+  filter(str_detect(sample, "PC")) %>%
+  ggplot(aes(x = sample, y = asv_prop, fill = ASV)) +
   geom_bar(stat = "identity") +
-  facet_grid(rows = vars(replicate), space = "free", scales = "free") +
-  theme_bw() +
+  theme_minimal()
+
+```
+
+```{r which-asv-proportions-to-remove}
+# based on asvs in the PC
+# because there are two positive controls
+# need to take the greater values of the two
+asv_prop_to_remove <- asv_prop_df %>%
+  filter(str_detect(sample, "PC")) %>%
+  ungroup() %>%
+  select(replicate, ASV, asv_prop) %>%
+  group_by(replicate, ASV) %>%
+  slice_max(order_by = asv_prop, n = 1) %>%
+  rename(prop_to_subtract = asv_prop)
+
+asv_prop_to_remove %>%
+  arrange(replicate, ASV)
+```
+
+
+```{r remove-asvs-props-from-PC-in-samples}
+pc_filtered_sample_df <- asv_prop_df %>%
+  left_join(., asv_prop_to_remove) %>%
+  mutate(new_asv_prop = ifelse(!is.na(prop_to_subtract), asv_prop-prop_to_subtract, asv_prop)) %>%
+  mutate(new_asv_prop = ifelse(new_asv_prop < 0, 0, new_asv_prop)) %>% # remove negative numbers
+  #filter(new_asv_prop > 0) %>%
+  mutate(reads_removed = prop_to_subtract*total_reads) %>%
+  select(-prop_to_subtract, -asv_prop)
+
+```
+Reads are removed by proportions based on individual replicates.
+
+
+Reads removed by tag-jumping:
+```{r summarize-reads-removed}
+pc_filtered_sample_df %>%
+  filter(!is.na(reads_removed))
+```
+
+this is a summary of the number of reads removed by ASV and sample_ID
+```{r summarize}
+decontaminated_1 <- pc_filtered_sample_df %>%
+  dplyr::select(sample, ASV, reads_removed) %>%
+  filter(!is.na(replicate) &
+           !is.na(reads_removed)) %>%
+  group_by(ASV) %>%
+  summarise(mean_reads = mean(reads_removed),
+            reads_q.05 = quantile(reads_removed, probs=0.05),
+            median_q.5 = median(reads_removed),
+            reads_q.95 = quantile(reads_removed, probs=0.95)) %>%
+  filter(mean_reads > 0) 
+
+decontaminated_1  
+
+```
+
+## Step 2. Account for contaminants in positive and negative controls 
+
+next we will remove ASVs that only occur in controls and not in environmental samples. 
+
+number of reads
+```{r}
+reads_per_type_ASV <- pc_filtered_sample_df %>%
+  left_join(., meta, by = c("ablg" = "extraction_ID")) %>% 
+  mutate(sample_type = ifelse(is.na(sample_type) & str_detect(ablg, "NC"), "pcr_blank", sample_type)) %>%
+  mutate(sample_type = ifelse(is.na(sample_type) & str_detect(ablg, "PC"), "positive_control", sample_type)) %>%
+  group_by(ASV, sample_type) %>%
+  summarize(TotalReadsPerASV = sum(reads, na.rm = TRUE)) %>%
+  arrange(ASV)
+
+```
+
+what ASVs have no reads in samples, but reads in the controls? 
+```{r}
+not_in_samples <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(is.na(sample)) %>% # here, Kim had a numeric, but mine are NA
+  replace(is.na(.), 0)
+
+not_in_samples
+```
+what ASVs do have reads in samples, but more reads in the controls? 
+```{r}
+more_in_pcr_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(pcr_blank > sample)
+head(more_in_pcr_blanks)
+
+more_in_extraction_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(extraction_blank > sample)
+head(more_in_extraction_blanks)
+
+more_in_pc_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(positive_control > sample)
+head(more_in_pc_blanks)
+
+
+```
+
+remove these from the asv table
+```{r}
+asv_table_filter2 <- pc_filtered_sample_df %>%
+  filter(!ASV %in% not_in_samples$ASV) %>%
+  select(-reads_removed, -total_reads, -new_asv_prop) %>%
+ filter(!ASV %in% more_in_pcr_blanks$ASV) %>%
+ filter(!ASV %in% more_in_extraction_blanks$ASV) #%>%
+  #filter(!ASV %in% more_in_fb_blanks$ASV)
+
+# Let's stick with ASVs that are just in the controls for filtering
+```
+
+
+
+## Step 3. Remove ASVs without taxonomic ID 
+
+now lets see how many of these ASVs have taxonomic IDs (these are not final tax ids)
+```{r output-from-blastn-and-taxonkit}
+taxonomy <- read_csv("csv_outputs/nfs_diet_mifish_inrange_collapsed_taxonomy.csv")
+
+combined_df <- asv_table_filter2 %>%
+  left_join(., taxonomy) 
+```
+
+```{r merge-data-frames-remove-NAs}
+combined_df %>%
+  filter(is.na(taxon)) %>%
+  ungroup() %>%
+  select(ASV) %>%
+  unique()
+
+```
+214 without taxonomy (in range) and removed.
+
+
+```{r remove-ASVs-without-taxonomy}
+combined_df_noNA <- combined_df %>%
+  filter(!is.na(taxon)) 
+
+combined_df_noNA %>%
+  group_by(taxon) %>%
+  summarise(sum(reads))
+
+```
+
+```{r filter-controls-analyze-samples}
+clean_df_filtered <- combined_df_noNA %>%
+  left_join(., meta, by = c("ablg" = "extraction_ID")) %>%
+  filter(sample_type == "sample" &
+           collection_year == "2025") %>%
+  filter(!taxon %in% c("Acipenser fulvescens", "Acipenser", "Callorhinus ursinus", "Eumetopias jubatus")) %>%
+  group_by(sample, taxon) %>%
+  mutate(taxon_reads = sum(reads)) %>%
+  select(-ASV, -reads) %>%
+  unique() %>%
+  ungroup() %>%
+  group_by(sample) %>%
+  mutate(total_reads = sum(taxon_reads)) %>%
+  select(sample, ablg, replicate, replicate, taxon_reads, taxon, total_reads, everything()) %>%
+  mutate(prop_taxon = taxon_reads/total_reads)
+  
+
+clean_df_filtered %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = taxon)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate)) +
+  theme_minimal() +
   theme(
     legend.position = "none",
     axis.text.x = element_text(angle = 90)
-  )
-  
-```
-
-
-
-```{r}
-df_for_prelim %>%
-  group_by(ablg, replicate) %>%
-  mutate(total_reads = sum(reads)) %>%
-  # first look at and then filter extraction blanks
-  #filter(sample_type != "sample")
-  filter(total_reads < 1000) # remove any replicate with fewer than 1000 reads
-#these are all extraction blanks - need to figure out why the sample type isn't showing up.
-
-compact_df <- df_for_prelim %>%
-  group_by(ablg, replicate) %>%
-  mutate(total_reads = sum(reads)) %>%
-  filter(total_reads > 1000) %>%
-  group_by(ablg, taxon) %>%
-  mutate(taxon_reads = mean(reads)) %>%
-  select(ablg, alternative_ID, source, location2, location3, taxon, taxonomic_level, taxon_reads) %>%
-  unique()
+  ) 
 
 ```
 
+
+```{r remove-samples-with-fewer-than-1000-total-reads}
+samples_to_remove <- clean_df_filtered %>%
+  filter(total_reads < 1000)
+
+clean_df_readDepth_filtered <- clean_df_filtered %>%
+  anti_join(., samples_to_remove)
+```
 ```{r}
-compact_df %>%
-  filter(taxonomic_level %in% c("species", "genus")) %>%
-  filter(taxon != "Callorhinus ursinus" & taxon_reads > 200) %>%
-  ggplot(aes(x = ablg, y = taxon_reads, fill = reorder(taxon, -taxon_reads))) +
+clean_df_readDepth_filtered %>%
+  filter(taxon_reads > 10) %>%
+ ggplot(aes(x = ablg, y = prop_taxon, fill = taxon)) +
   geom_bar(stat = "identity") +
-  facet_grid(cols = vars(source), space = "free", scales = "free") +
-  theme_bw() +
+  facet_grid(rows = vars(replicate)) +
+  theme_minimal() +
   theme(
     #legend.position = "none",
     axis.text.x = element_text(angle = 90)
-  )
-  
-  
+  ) 
+
 ```
+Hmm. In some ways, that filtering wasn't as effective.
+
+Additional species to exclude: any mammals at this stage...
 
 ```{r}
-compact_df %>%
-  filter(taxonomic_level %in% c("species", "genus")) %>%
-  filter(taxon != "Callorhinus ursinus") %>%
-  select(ablg, taxon) %>%
+# what is 1500 reads of pronghorn doing in one sample?
+# ringed seal?
+# gray whale?
+filtered_df <- clean_df_readDepth_filtered %>%
+  filter(prop_taxon > 0.01) %>% # must be great than 1% of reads
+  filter(!taxon %in% c("Antilocapra americana", "Pusa", "Phocoenoides dalli", "Eschrichtius robustus", "Perciformes", "Gadidae", "Hexagrammos decagrammus", "Hexagrammos"))
+
+```
+
+```{r color-palette}
+pub_colors <- c(
+  "#0072B2",  # blue
+  "#D55E00",  # vermillion
+  "#009E73",  # green
+  "#CC79A7",  # purple-pink
+  "#E69F00",  # orange
+  "#56B4E9",  # sky blue
+  "#F0E442",  # yellow
+  "#000000",  # black
+  "#7B3294",  # deep purple
+  "#A65628",  # brown
+  "#1B9E77",  # teal
+  "#E7298A",  # magenta
+  "#66A61E",  # olive green
+  "#E6AB02",  # mustard
+  "#7570B3",  # slate purple
+  "#E41A1C",  # red
+  "#4DAF4A",  # green
+  "#377EB8",  # blue
+  "#984EA3",  # violet
+  "#FF7F00"   # orange
+)
+
+
+```
+
+
+```{r plot-using-rookery-info}
+filtered_df %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(location3), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+      legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "2025 St. Paul NFS diets",
+    x = "sample", 
+    y = "proportion of reads"
+  ) +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp.png", width = 10, height = 4)
+```
+
+
+Take a closer look at salmon:
+
+```{r salmon-in-diets}
+filtered_df %>%
+  filter(str_detect(taxon, "Oncorhynchus")) %>%
+  ggplot(aes(x = alternative_ID, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(location3), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+           legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "Salmon in 2025 St. Paul NFS diets",
+    x = "sample", 
+    y = "proportion of reads"
+  )  +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_salmon.png", width = 8, height = 4)
+```
+
+
+```{r look-at-fecal-loops-vs-scats}
+filtered_df %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(source), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+      legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "2025 St. Paul NFS diets, fecal loops vs. scats",
+    x = "sample", 
+    y = "proportion of reads"
+  ) +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp_source.png", width = 10, height = 4)
+
+
+```
+
+```{r top-species}
+# deal with the duplicate samples from scats
+filtered_df %>%
+  ungroup() %>%
+  select(ablg, alternative_ID, taxon, source) %>%
   unique() %>%
-  group_by(taxon) %>%
-  tally() %>%
-  arrange(desc(n))
-
+  mutate(
+    sample_id = if_else(
+      str_detect(alternative_ID, "^NFS"),
+      str_remove(alternative_ID, "[A-Za-z]$"),
+      alternative_ID
+    )
+  ) %>%
+  select(-alternative_ID, -ablg) %>% # assuming the sample_id is unique to each physical sample.
+  unique() %>%
+  group_by(taxon, source) %>%
+  tally(name = "n_samples_per_taxon") %>%
+  arrange(desc(n_samples_per_taxon)) %>%
+  write_csv("csv_outputs/2025_prib_filtered_taxon_FO.csv")
 ```
 
-```{r}
-compact_df %>%
-  ungroup() %>%
-  select(ablg) %>%
-  unique()
-```
 
-```{r}
-compact_df %>%
-  filter(taxonomic_level %in% c("species", "genus")) %>%
-  filter(taxon != "Callorhinus ursinus") %>%
-  filter(taxon == "Ammodytes personatus") %>%
-  ungroup() %>%
-  summarise(median(taxon_reads))
-```
+Seems like a reasonable place to pause the analysis for now and share with Jamie, Tonya, and Katie.
 
-How many reads in the extraction blanks?
-```{r}
-sample_df_w_meta %>%
-  filter(sample_type == "extraction_blank") %>%
-  select(ablg, replicate, ASV, reads, alternative_ID, taxon) %>%
-  ggplot(aes(x = ablg, y = reads, fill = taxon)) +
-  geom_bar(stat = "identity") +
-  facet_grid(rows = vars(replicate), space = "free", scales = "free") +
-  theme_bw() +
-  theme(
-    #legend.position = "none",
-    axis.text.x = element_text(angle = 90)
-  )
-  
 
-```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
