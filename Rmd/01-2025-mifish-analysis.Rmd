@@ -883,7 +883,7 @@ Additional species to exclude: any mammals at this stage...
 # gray whale?
 filtered_df <- clean_df_readDepth_filtered %>%
   filter(prop_taxon > 0.01) %>% # must be great than 1% of reads
-  filter(!taxon %in% c("Antilocapra americana", "Pusa", "Phocoenoides dalli", "Eschrichtius robustus", "Perciformes", "Gadidae", "Hexagrammos decagrammus", "Hexagrammos"))
+  filter(!taxon %in% c("Antilocapra americana", "Pusa", "Phocoenoides dalli", "Eschrichtius robustus", "Perciformes", "Gadidae"))
 
 ```
 
@@ -908,7 +908,9 @@ pub_colors <- c(
   "#4DAF4A",  # green
   "#377EB8",  # blue
   "#984EA3",  # violet
-  "#FF7F00"   # orange
+  "#FF7F00",  # orange
+  "#A6CEE3",  # light blue
+  "firebrick"   # dark brown
 )
 
 
