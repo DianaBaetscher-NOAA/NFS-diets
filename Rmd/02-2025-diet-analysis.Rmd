@@ -1,0 +1,989 @@
+---
+title: "02-2025-diet-analysis"
+author: "diana baetscher"
+date: "2026-10-15"
+output: html_document
+---
+
+Following the initial bioinformatic analysis in `01-2025-mifish-analysis.Rmd`
+
+This is a clean Rmd that doesn't require moving between R and terminal.
+
+
+```{r load-libraries}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+
+# for adding distribution data
+library(rfishbase)
+
+```
+
+```{r mifish-taxonomy}
+taxonomy <-read_tsv("../Rmd/blast_outputs/NFS_diet_mifish_shorttaxlineage.txt", col_names = F)
+
+# first clean up the header
+taxon_df <- taxonomy %>%
+  select(-X2, -(X4:X16)) %>%  #remove unnecessary columns
+  group_by(X1, X17) %>% # group by the sequence key and the full taxonomy to reduce duplicate entries
+  unique() %>% # doing that reduced the number of entries significantly
+  rename(ASV=X1, perc_id=X3, taxonomy=X17) %>% #rename headers
+  filter(!str_detect(taxonomy, "environmental")) %>% # filter out any environmental samples
+  filter(!str_detect(taxonomy, "synthetic")) %>% # filter out any synthetic "samples"
+  filter(!str_detect(taxonomy, "bacterium")) %>%
+  filter(!str_detect(taxonomy, "bacteria")) %>%
+  filter(!str_detect(taxonomy, "cultured")) %>% # formatting the taxonomy variables
+  filter(str_detect(taxonomy, ";")) %>%
+  separate(taxonomy, into=c("kingdom", "phylum", "class", "order", "family", "genus", "species"), sep = ";") %>% 
+  filter(!str_detect(species, " x ")) %>% # remove hybrids
+   # remove other stuff that isn't on-target or out of range
+   filter(!species %in% c("Homo sapiens", "Canis lupus", "Pan paniscus")) %>% # remove species outside of their range
+  # filter(!str_detect(species, " sp. ")) %>%
+   filter(!genus %in% c("Sus", "Bos", "Gorilla")) #%>% # remove non-marine mammals
+  # filter(!order %in% c("Primates"))
+
+```
+
+## what non-fish are here? 
+```{r}
+not_Actinopteri <- taxon_df %>%
+  ungroup() %>%
+  filter(class != "Actinopteri") %>%
+  select(species, genus, family, order, class, phylum) %>%
+  unique() %>%
+  select(species)
+
+not_Actinopteri %>%
+  left_join(., taxon_df)
+```
+
+## now look at the fish and figure out what taxa are in/out of our range
+```{r}
+to_check_range <- taxon_df %>%
+  ungroup() %>%
+  filter(class == "Actinopteri") %>%
+  select(species, genus, family, order, class, phylum) %>%
+  unique()
+
+```
+
+## check ranges for species using rfishbase 
+
+
+```{r check-for-synonyms}
+
+#first, validate species names using rfishbase synonyms
+spp_df <- synonyms(to_check_range$species) # this takes a few minutes
+
+syn <- spp_df %>%
+  filter(Status == "synonym")
+
+# this performs the by-row substitution for the synonyms
+to_check_range2 <- to_check_range %>%
+  left_join(., spp_df, by = c("species" = "synonym")) %>%
+  #filter(Status == "synonym") %>%
+  mutate(validated_species = ifelse(Status == "synonym", Species, species))
+
+to_check_range2 %>%
+  filter(validated_species != species) %>%
+  select(species, Species, validated_species)
+```
+
+```{r apply-distribution-range-info}
+# this loads a large table into memory
+# but doesn't take long
+fishbase_spp <- fb_tbl("species")
+head(fishbase_spp)
+
+# get distribution info
+spp_distribution <- faoareas(to_check_range2$validated_species) %>%
+  select(Species, FAO) %>%
+  unique()
+
+# add column to designate if we will consider a species as "in range"- for this study, this will be NE Pacific and Arctic Ocean
+spp_distribution_range <- spp_distribution %>%
+  mutate(in_range = ifelse(is.na(FAO), NA, "no"),
+         in_range = ifelse(FAO == "Pacific, Northeast", "yes", in_range))
+          #in_range = ifelse(FAO == "Arctic Ocean", "yes", in_range)) # not expecting arctic species, but leaving this in
+
+# confirm that the species look appropriate
+# add back synonyms that could be in the blastn output
+syn_to_addback <- spp_distribution_range %>%
+  inner_join(., syn) %>%
+  filter(in_range == "yes") %>%
+  select(Species, synonym, FAO, in_range) %>%
+  unique() %>%
+  rename(species = Species)
+
+# keep just a list of spp names and yes/no/NA for "in range"  - this way we can keep track of what spp didn't have any reference information in fishbase to determine range
+spp_in_range <- spp_distribution_range %>%
+  select(Species, FAO, in_range) %>%
+  filter(in_range == "yes") %>%
+  unique() %>%
+  rename(species = Species) 
+
+all_taxa_in_range <- bind_rows(spp_in_range, syn_to_addback, not_Actinopteri) %>%
+  select(species) %>%
+  unique()
+# some Atlantic species end up in there because of the Arctic...
+```
+
+```{r filtering-taxonomy-based-on-distribution-data}
+
+# add back in mammals and non-fishes
+nonfish <- taxon_df %>%
+  filter(class != "Actinopteri")
+
+# keep species that are within the appropriate distribution
+taxa_in_range <- taxon_df %>%
+  inner_join(., all_taxa_in_range) %>%
+  bind_rows(nonfish)
+
+# blastn results that are excluded based on distributions
+taxon_df %>%
+  ungroup() %>%
+  anti_join(., all_taxa_in_range) %>%
+  select(species) %>%
+  unique()
+
+
+taxa_in_range 
+```
+
+These all look reasonable to exclude.
+
+Now, using those data, let's go through this procedure to identify the appropriate taxonomic level for each sequence.
+
+
+There are four categories:
+1. sequences that match a single species unambiguously (the minority)
+
+Sequences that match multiple species are divided in three categories:
+2. top matches > 0.5% identity than second-ranked matches
+3. top matches < 0.5% identity than second-ranked matches
+4. Multiple top matches with the same % identity
+
+```{r single-species-sequences}
+# 1. sequences that are unambiguously a single species
+single_spp_seqs <- taxa_in_range %>% 
+  group_by(ASV, species) %>%
+  tally() %>% # how many species per ASV?
+  group_by(ASV) %>%
+  select(-n) %>%
+  add_tally(name = "n_taxa") %>%
+  filter(n_taxa == 1)
+  
+single_spp_seqs %>%
+  left_join(., taxa_in_range) %>%
+  select(perc_id, ASV, species)
+
+```
+How many species do those ASVs represent?
+```{r}
+single_spp_seqs %>%
+  ungroup() %>%
+  select(species) %>%
+  unique()
+```
+
+
+```{r filter-taxonomy-to-exclude-single-species-ASVs}
+# remove the single-species seqs from the dataframe and then rank the hits by % identity for the remaining seqs
+seq_id_diff <- taxa_in_range %>%
+  anti_join(., single_spp_seqs) %>%
+  group_by(ASV, species, genus, family, order, class, phylum, kingdom) %>%
+    mutate(seq_percID = max(perc_id)) %>%
+    group_by(ASV, species, genus, family, order, class, phylum, kingdom, seq_percID) %>%
+  summarise(max(seq_percID)) %>% # take just the top hit for each taxon (for each sequence)
+  select(-`max(seq_percID)`) %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+      mutate(id_rank = rank(desc(seq_percID), ties.method = "min")) %>% # rank the taxonomic hits per sequence by % id
+       mutate(top_perc = max(seq_percID)) %>% # designate the highest % id for the best taxonomic hit in each sequence (in some, but not all cases, this is 100%)   
+      mutate(diff = top_perc - seq_percID) %>% # calculate the difference between the % identity of the top hit and each subsequent taxonomic hit
+        arrange(diff)
+
+seq_id_diff %>%
+  filter(diff > 0.5)
+```
+
+```{r investigate-salmon-asvs}
+# salmon with 100% sequence matches?
+seq_id_diff %>%
+  filter(genus == "Oncorhynchus") %>%
+  filter(seq_percID != 100) %>%
+  arrange(ASV)
+
+# salmon
+seq_id_diff %>%
+  filter(genus == "Oncorhynchus") %>%
+  arrange(ASV, id_rank) %>%
+  filter(diff < 1) # remove potential hits that are >1% different
+
+  # group_by(ASV) %>%
+  # add_tally() %>%
+  # filter(n == 1) %>%
+  # tally() %>%
+  # left_join(., seq_id_diff) %>%
+  # filter(diff < 0.5)
+```
+
+```{r}
+seq_id_diff %>%
+  filter(genus == "Gadus") %>%
+  filter(seq_percID == 100) %>%
+  arrange(ASV)
+```
+
+Now I have the single best entry for each species for each sequence ranked with the difference between the first and second ranked entries calculated.
+
+For sequences with multiple top hits, where the difference between ranked taxa = 0, I will end up defaulting to genus- or family-level ID (or carrying the individual species info around in some capacity). I will do the same for any sequences where the difference betweeen the first and second ranked taxa is < 0.5%.
+
+
+Figure out which differences are > 0.5% and eliminate those first?
+```{r remove-low-perc-identity-matches}
+# filter out any taxa that are >1% less matching identity than the top taxonomic hit for a given sequence
+to_remove_low_perc_hits <- seq_id_diff %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+  filter(diff > 0.5) # using a 0.5% threshold, there are 1719 rows in this df
+
+keepers <- seq_id_diff %>%
+  anti_join(to_remove_low_perc_hits)
+
+```
+
+```{r all-higher-level-taxonomic-assignments}
+# this data frame includes only those taxonomic hits that should be considered.
+# so now I need to determine whether they should be assigned to genus, family, order, etc. 
+
+# Single-species matches now that we've filtered based on percent identity
+singleton_df <- keepers %>%
+  select(ASV) %>%
+  tally() %>%
+  filter(n == 1) %>% # these are the seqs that now have only a single match
+  left_join(keepers) %>%
+  select(-n) %>%
+  bind_rows(single_spp_seqs) %>% # combine the single spp data
+  mutate(taxonomic_level = "species") %>%
+  mutate(taxon = species)
+
+## Genus-level matches
+# remove the singletons from the bigger df 
+single_genus <- keepers %>%
+  anti_join(., singleton_df, by = "ASV") %>% # at best, these should be genus-level matches
+  group_by(ASV, genus) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+  tally() %>%
+  filter(n == 1) %>% # seqs that match a single genus
+  select(-n) %>%
+  left_join(., keepers) %>%
+  mutate(taxonomic_level = "genus") %>%
+  mutate(taxon = genus)
+  
+
+## Family-level matches
+single_family <- keepers %>%
+  anti_join(., singleton_df, by = "ASV") %>%
+  anti_join(., single_genus) %>%
+  group_by(ASV, family) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+  tally() %>%
+  filter(n == 1) %>% # seqs that match a single family
+  select(-n) %>%
+  left_join(., keepers) %>%
+  mutate(taxonomic_level = "family") %>%
+  mutate(taxon = family)
+
+
+## Order-level matches
+single_order <- keepers %>%
+ anti_join(., singleton_df, by = "ASV") %>%
+  anti_join(., single_genus) %>%
+  anti_join(., single_family) %>%
+  group_by(ASV, order) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+  tally() %>%
+  filter(n == 1) %>% # seqs that match a single order
+  select(-n) %>%
+  left_join(., keepers) %>%
+  mutate(taxonomic_level = "order") %>%
+  mutate(taxon = order)
+
+
+## Class-level matches
+single_class <- keepers %>%
+  anti_join(., singleton_df, by = "ASV") %>%
+  anti_join(., single_genus) %>%
+  anti_join(., single_family) %>%
+  anti_join(., single_order) %>%
+  group_by(ASV, class) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(ASV) %>%
+  tally() %>% 
+  filter(n == 1) %>% # seqs that match a single class
+  select(-n) %>%
+  left_join(., keepers) %>%
+  mutate(taxonomic_level = "class") %>%
+  mutate(taxon = class)
+
+# no higher level taxonomy was relevant in this dataset.
+```
+
+```{r combine-taxonomic-level-df}
+# combine those sub-dataframes
+tax_df_w_gadidSalmon <- bind_rows(singleton_df, single_genus, single_family, single_order, single_class) %>%
+  select(-id_rank, -top_perc, -diff, -seq_percID, -n_taxa) %>%
+  unique()
+  
+```
+
+Create output taxonomy data frames
+```{r output-taxonomy}
+uncollapsed_taxonomy <- tax_df_w_gadidSalmon %>%
+  #select(-top_perc, -id_rank) %>%
+  unique()
+
+# quick look at the taxonomy before collapsing it:
+uncollapsed_taxonomy %>%
+  write_csv("csv_outputs/nfs_diet_mifish_inrange_uncollapsed_taxonomy.csv")
+
+# and then collapse that down to just a single taxon per ASV
+collapsed_taxonomy <- uncollapsed_taxonomy %>%
+  select(ASV, taxon, taxonomic_level) %>%
+  unique()
+
+# then remove those high level taxonomic assignments that aren't informative
+collapsed_taxonomy %>%
+  #filter(!taxonomic_level %in% c("class", "order")) %>%
+  select(-ASV) %>%
+  unique()
+
+collapsed_taxonomy %>%
+  select(-ASV) %>%
+  unique() %>%
+  group_by(taxonomic_level) %>%
+  tally()
+
+collapsed_taxonomy %>%
+  write_csv("csv_outputs/nfs_diet_mifish_inrange_collapsed_taxonomy.csv")
+```
+
+Look at how many reads they got:
+
+```{r look-at-reads-by-sample-by-ASV}
+df <- read_csv("csv_outputs/NFS_diets_MiFish_ASVtable.csv") %>%
+  rename(sample = `...1`)
+
+# reformat
+# dealing with the positive and negative controls having a different pattern
+sample_df <- df %>%
+  pivot_longer(2:length(df), names_to = "ASV", values_to = "reads") %>%
+  filter(reads > 0) %>%
+  separate(
+    sample,
+    into = c("ablg", "replicate"),
+    sep = "-(?=[^-]+$)",
+    remove = FALSE
+  )
+
+head(sample_df)
+```
+```{r pull-in-metadata}
+meta <- read_csv("../metadata/NFS_diets_metadata_20261005.csv")
+
+# add metadata to the sample
+sample_df_w_meta <- sample_df %>%
+  left_join(., meta, by = c("ablg" = "extraction_ID")) %>%
+  left_join(., collapsed_taxonomy, by = "ASV") %>%
+  select(ablg, replicate, ASV, reads, alternative_ID, source, collection_year, location1, location2, location3, sample_type, taxon, taxonomic_level)
+
+sample_df_w_meta %>%
+  filter(sample_type == "sample") %>%
+  filter(collection_year == "2025") %>%
+  select(ablg, alternative_ID) %>%
+  unique()
+
+```
+
+# account for likely contaminants 
+
+- tag-jumping
+- negative PCR controls
+- field negatives
+
+
+## Step 1. Account for tag-jumping by using the positive controls 
+
+subtract the proportion of reads that jumped into the positive control samples from each environmental sample 
+
+```{r tag-jumping-by-ASVs-in-PC}
+# on a per-plate basis, what % of each ASV should be subtracted from the samples?
+asv_prop_df <- sample_df %>%
+  group_by(sample) %>%
+  mutate(total_reads = sum(reads)) %>%
+  mutate(asv_prop = reads/total_reads)
+  
+asv_prop_df %>%
+  filter(str_detect(sample, "PC")) %>%
+  ggplot(aes(x = sample, y = asv_prop, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme_minimal()
+
+```
+
+```{r which-asv-proportions-to-remove}
+# based on asvs in the PC
+# because there are two positive controls
+# need to take the greater values of the two
+asv_prop_to_remove <- asv_prop_df %>%
+  filter(str_detect(sample, "PC")) %>%
+  ungroup() %>%
+  select(replicate, ASV, asv_prop) %>%
+  group_by(replicate, ASV) %>%
+  slice_max(order_by = asv_prop, n = 1) %>%
+  rename(prop_to_subtract = asv_prop)
+
+asv_prop_to_remove %>%
+  arrange(replicate, ASV)
+```
+
+
+```{r remove-asvs-props-from-PC-in-samples}
+pc_filtered_sample_df <- asv_prop_df %>%
+  left_join(., asv_prop_to_remove) %>%
+  mutate(new_asv_prop = ifelse(!is.na(prop_to_subtract), asv_prop-prop_to_subtract, asv_prop)) %>%
+  mutate(new_asv_prop = ifelse(new_asv_prop < 0, 0, new_asv_prop)) %>% # remove negative numbers
+  #filter(new_asv_prop > 0) %>%
+  mutate(reads_removed = prop_to_subtract*total_reads) %>%
+  select(-prop_to_subtract, -asv_prop)
+
+```
+Reads are removed by proportions based on individual replicates.
+
+
+Reads removed by tag-jumping:
+```{r summarize-reads-removed}
+pc_filtered_sample_df %>%
+  filter(!is.na(reads_removed))
+```
+
+this is a summary of the number of reads removed by ASV and sample_ID
+```{r summarize}
+decontaminated_1 <- pc_filtered_sample_df %>%
+  dplyr::select(sample, ASV, reads_removed) %>%
+  filter(!is.na(replicate) &
+           !is.na(reads_removed)) %>%
+  group_by(ASV) %>%
+  summarise(mean_reads = mean(reads_removed),
+            reads_q.05 = quantile(reads_removed, probs=0.05),
+            median_q.5 = median(reads_removed),
+            reads_q.95 = quantile(reads_removed, probs=0.95)) %>%
+  filter(mean_reads > 0) 
+
+decontaminated_1  
+
+```
+
+## Step 2. Account for contaminants in positive and negative controls 
+
+next we will remove ASVs that only occur in controls and not in environmental samples. 
+
+number of reads
+```{r}
+reads_per_type_ASV <- pc_filtered_sample_df %>%
+  left_join(., meta, by = c("ablg" = "extraction_ID")) %>% 
+  mutate(sample_type = ifelse(is.na(sample_type) & str_detect(ablg, "NC"), "pcr_blank", sample_type)) %>%
+  mutate(sample_type = ifelse(is.na(sample_type) & str_detect(ablg, "PC"), "positive_control", sample_type)) %>%
+  group_by(ASV, sample_type) %>%
+  summarize(TotalReadsPerASV = sum(reads, na.rm = TRUE)) %>%
+  arrange(ASV)
+
+```
+
+what ASVs have no reads in samples, but reads in the controls? 
+```{r}
+not_in_samples <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(is.na(sample)) %>% # here, Kim had a numeric, but mine are NA
+  replace(is.na(.), 0)
+
+not_in_samples
+```
+what ASVs do have reads in samples, but more reads in the controls? 
+```{r}
+more_in_pcr_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(pcr_blank > sample)
+head(more_in_pcr_blanks)
+
+more_in_extraction_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(extraction_blank > sample)
+head(more_in_extraction_blanks)
+
+more_in_pc_blanks <- reads_per_type_ASV %>%
+  pivot_wider(names_from = "sample_type", values_from = c("TotalReadsPerASV")) %>%
+  filter(sample > 1) %>%
+  filter(positive_control > sample)
+head(more_in_pc_blanks)
+
+
+```
+
+remove these from the asv table
+```{r}
+asv_table_filter2 <- pc_filtered_sample_df %>%
+  filter(!ASV %in% not_in_samples$ASV) %>%
+  select(-reads_removed, -total_reads, -new_asv_prop) %>%
+ filter(!ASV %in% more_in_pcr_blanks$ASV) %>%
+ filter(!ASV %in% more_in_extraction_blanks$ASV) #%>%
+  #filter(!ASV %in% more_in_fb_blanks$ASV)
+
+# Let's stick with ASVs that are just in the controls for filtering
+```
+
+
+
+## Step 3. Remove ASVs without taxonomic ID 
+
+now lets see how many of these ASVs have taxonomic IDs (these are not final tax ids)
+```{r output-from-blastn-and-taxonkit}
+taxonomy <- read_csv("csv_outputs/nfs_diet_mifish_inrange_collapsed_taxonomy.csv")
+
+combined_df <- asv_table_filter2 %>%
+  left_join(., taxonomy) 
+```
+
+```{r merge-data-frames-remove-NAs}
+combined_df %>%
+  filter(is.na(taxon)) %>%
+  ungroup() %>%
+  select(ASV) %>%
+  unique()
+
+```
+214 without taxonomy (in range) and removed.
+
+
+```{r remove-ASVs-without-taxonomy}
+combined_df_noNA <- combined_df %>%
+  filter(!is.na(taxon)) 
+
+combined_df_noNA %>%
+  group_by(taxon) %>%
+  summarise(sum(reads))
+
+```
+
+```{r filter-controls-analyze-samples}
+clean_df_filtered <- combined_df_noNA %>%
+  left_join(., meta, by = c("ablg" = "extraction_ID")) %>%
+  filter(sample_type == "sample" &
+           collection_year == "2025") %>%
+  filter(!taxon %in% c("Acipenser fulvescens", "Acipenser", "Callorhinus ursinus", "Eumetopias jubatus")) %>%
+  group_by(sample, taxon) %>%
+  mutate(taxon_reads = sum(reads)) %>%
+  select(-ASV, -reads) %>%
+  unique() %>%
+  ungroup() %>%
+  group_by(sample) %>%
+  mutate(total_reads = sum(taxon_reads)) %>%
+  select(sample, ablg, replicate, replicate, taxon_reads, taxon, total_reads, everything()) %>%
+  mutate(prop_taxon = taxon_reads/total_reads)
+  
+
+clean_df_filtered %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = taxon)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90)
+  ) 
+
+```
+
+
+```{r remove-samples-with-fewer-than-1000-total-reads}
+samples_to_remove <- clean_df_filtered %>%
+  filter(total_reads < 1000)
+
+clean_df_readDepth_filtered <- clean_df_filtered %>%
+  anti_join(., samples_to_remove)
+```
+```{r}
+clean_df_readDepth_filtered %>%
+  filter(taxon_reads > 10) %>%
+ ggplot(aes(x = ablg, y = prop_taxon, fill = taxon)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate)) +
+  theme_minimal() +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90)
+  ) 
+
+```
+Hmm. In some ways, that filtering wasn't as effective.
+
+Additional species to exclude: any mammals at this stage...
+
+```{r}
+# what is 1500 reads of pronghorn doing in one sample?
+# ringed seal?
+# gray whale?
+filtered_df <- clean_df_readDepth_filtered %>%
+  filter(prop_taxon > 0.01) %>% # must be great than 1% of reads
+  filter(!taxon %in% c("Antilocapra americana", "Pusa", "Phocoenoides dalli", "Eschrichtius robustus", "Perciformes", "Gadidae"))
+
+```
+
+```{r color-palette}
+pub_colors <- c(
+  "#0072B2",  # blue
+  "#D55E00",  # vermillion
+  "#009E73",  # green
+  "#CC79A7",  # purple-pink
+  "#E69F00",  # orange
+  "#56B4E9",  # sky blue
+  "#F0E442",  # yellow
+  "#000000",  # black
+  "#7B3294",  # deep purple
+  "#A65628",  # brown
+  "#1B9E77",  # teal
+  "#E7298A",  # magenta
+  "#66A61E",  # olive green
+  "#E6AB02",  # mustard
+  "#7570B3",  # slate purple
+  "#E41A1C",  # red
+  "#4DAF4A",  # green
+  "#377EB8",  # blue
+  "#984EA3",  # violet
+  "#FF7F00",  # orange
+  "#A6CEE3",  # light blue
+  "firebrick"   # dark brown
+)
+
+
+```
+
+
+```{r plot-using-rookery-info}
+filtered_df %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(location3), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+      legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "2025 St. Paul NFS diets",
+    x = "sample", 
+    y = "proportion of reads"
+  ) +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp.png", width = 10, height = 4)
+```
+
+
+Take a closer look at salmon:
+
+```{r salmon-in-diets}
+filtered_df %>%
+  filter(str_detect(taxon, "Oncorhynchus") | str_detect(taxon, "Gadus")) %>%
+  ggplot(aes(x = alternative_ID, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(location3), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+           legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "Salmon in 2025 St. Paul NFS diets",
+    x = "sample", 
+    y = "proportion of reads"
+  )  +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_salmon_gadids.png", width = 8, height = 4)
+```
+
+
+```{r look-at-fecal-loops-vs-scats}
+filtered_df %>%
+  ggplot(aes(x = ablg, y = prop_taxon, fill = reorder(taxon, -prop_taxon))) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(replicate), cols = vars(source), space = "free", scales = "free") +
+    theme_bw() +
+    theme(
+      legend.key.size = unit(0.3, "cm"),
+      axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.title.x = element_text(margin = margin(t = 10))
+    )  +
+  labs(
+    fill = "taxon",
+    title = "2025 St. Paul NFS diets, fecal loops vs. scats",
+    x = "sample", 
+    y = "proportion of reads"
+  ) +
+  scale_fill_manual(values = pub_colors)
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp_source.png", width = 10, height = 4)
+
+
+```
+
+```{r top-species}
+# deal with the duplicate samples from scats
+filtered_df %>%
+  ungroup() %>%
+  select(ablg, alternative_ID, taxon, source) %>%
+  unique() %>%
+  mutate(
+    sample_id = if_else(
+      str_detect(alternative_ID, "^NFS"),
+      str_remove(alternative_ID, "[A-Za-z]$"),
+      alternative_ID
+    )
+  ) %>%
+  select(-alternative_ID, -ablg) %>% # assuming the sample_id is unique to each physical sample.
+  unique() %>%
+  group_by(taxon, source) %>%
+  tally(name = "n_samples_per_taxon") %>%
+  arrange(desc(n_samples_per_taxon)) %>%
+  write_csv("csv_outputs/2025_prib_filtered_taxon_FO.csv")
+```
+
+
+Now looking at the rookeries according to the English Bay/East categories in the ESR.
+
+Katie Luxa told me that 
+Vostochni and Polovina Cliffs --> SP East
+Zapadni Reef --> SP English Bay
+
+So given that...
+Exclude the fecal loops for the time being.
+Compare the scats across the two areas.
+```{r}
+
+
+```
+
+```{r}
+n_sample_by_region <- filtered_df %>%
+  filter(source != "fecal loop") %>%
+  mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East")) %>%
+  ungroup() %>%
+  select(ablg, alternative_ID, taxon, region) %>%
+  unique() %>%
+  mutate(
+    sample_id = if_else(
+      str_detect(alternative_ID, "^NFS"),
+      str_remove(alternative_ID, "[A-Za-z]$"),
+      alternative_ID
+    )
+  ) %>%
+  select(-alternative_ID, -ablg) %>% # assuming the sample_id is unique to each physical sample.
+  unique() %>%
+  group_by(sample_id, region) %>%
+  tally(name = "n_species_per_sample") %>%
+  group_by(region) %>%
+  add_tally(name = "n_samples_by_region") %>%
+  select(region, n_samples_by_region) %>%
+  ungroup()
+
+# add that info onto the earlier dataframe that includes species
+fo_data <- filtered_df %>%
+  filter(source != "fecal loop") %>%
+  mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East")) %>%
+  ungroup() %>%
+  select(ablg, alternative_ID, taxon, region) %>%
+  unique() %>%
+  mutate(
+    sample_id = if_else(
+      str_detect(alternative_ID, "^NFS"),
+      str_remove(alternative_ID, "[A-Za-z]$"),
+      alternative_ID
+    )
+  ) %>%
+  select(-alternative_ID, -ablg) %>% # assuming the sample_id is unique to each physical sample.
+  unique() %>%
+  group_by(taxon, region) %>%
+  tally(name = "n_samples_per_taxon") %>%
+  arrange(desc(n_samples_per_taxon)) %>%
+  left_join(., n_sample_by_region) %>%
+  unique() %>%
+  mutate(freq = n_samples_per_taxon/n_samples_by_region*100)
+
+
+fo_data %>%
+  ggplot(aes(x = freq, y = reorder(taxon, n_samples_per_taxon), fill = region)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  theme_minimal() +
+  labs(
+    x = "Frequency of occurrence (%)",
+    y = "",
+    title = "St. Paul - 2025 metabarcoding diets"
+  ) +
+  theme(
+    axis.text.y = element_text(vjust = 0.5),
+    axis.title.x = element_text(margin = margin(t = 5))
+  ) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("navyblue", "goldenrod1"))
+
+
+ggsave("pdf_outputs/2025_stpaul_filtered_FO.png", width = 5.5, height = 4)
+```
+
+But, if we wanted to take into account the relative proportion of the diet items, how might that change things?
+
+
+
+## hard parts data
+
+To compare sample-to-sample
+
+```{r hard-parts-from-katie-luxa}
+hp <- read_csv("../data/hard_parts/NFS Diet 2025.csv")
+
+# lots of formatting required.
+hp_w_dna <- hp %>%
+  filter(dna != "no") %>%
+  #select(sitename, dna) %>% # the sitename plus dna id is unique.
+  #unique() %>%
+  separate(sitename, into = c("loc1", "location3"), 
+           sep = " \\(",
+    remove = TRUE) %>%
+    mutate(location3 = str_remove(location3, "\\)$"),
+    across(c(loc1, location3), str_to_title))
+
+  
+```
+
+
+
+
+```{r getting-data-oriented-for-ESR}
+mb_subsamples <- filtered_df %>%
+  ungroup() %>%
+  filter(source != "fecal loop") %>%
+  separate(alternative_ID, into = c("dna", "subsample"),
+            sep = "(?<=\\d)(?=[A-Za-z])") %>%
+  select(location3, dna, subsample, taxon, prop_taxon) %>%
+  unique() %>%
+  group_by(location3, dna, subsample, taxon) %>%
+  mutate(mean_prop = mean(prop_taxon)) %>%
+  select(-prop_taxon) %>%
+  unique() %>%
+  ungroup() %>%
+  mutate(scat_id = paste0(location3,"_",dna)) %>%
+  mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East"))
+
+
+mb_subsamples %>%
+  ggplot(aes(x = scat_id, y = mean_prop, fill = reorder(taxon, -mean_prop))) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(subsample), cols = vars(region), space = "free", scales = "free", labeller = label_both) +
+  theme_bw() +
+    theme(
+      legend.key.size = unit(0.4, "cm"),
+      #axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.text.x = element_blank(),
+      axis.title.x = element_text(margin = margin(t = 10)),
+      legend.position = "bottom"
+    )  +
+  labs(
+    fill = "",
+    title = "2025 St. Paul Northern Fur Seal diets\nDNA metabarcoding of scats",
+    x = "sample", 
+    y = "proportion of reads"
+  ) +
+  scale_fill_manual(values = pub_colors)
+
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp_complex.png", width = 8, height = 7)
+  
+```
+
+
+```{r}
+# better to take the mean across all replicates and subsamples at the same time!
+filtered_df %>%
+  ungroup() %>%
+  filter(source != "fecal loop") %>%
+  separate(alternative_ID, into = c("dna", "subsample"),
+            sep = "(?<=\\d)(?=[A-Za-z])") %>%
+  select(location3, dna, taxon, prop_taxon) %>%
+  unique() %>%
+  group_by(location3, dna, taxon) %>%
+  mutate(mean_prop = mean(prop_taxon)) %>%
+  select(-prop_taxon) %>%
+  unique() %>%
+  ungroup() %>%
+  filter(mean_prop > 0.02) %>% # greater than 2% of reads
+  # and then rescale
+  group_by(location3, dna) %>%
+  mutate(tot_prop = sum(mean_prop)) %>%
+  mutate(taxon_prop = mean_prop/tot_prop) %>%
+  mutate(scat_id = paste0(location3,"_",dna)) %>%
+  mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East")) %>%
+  unique() %>%
+  ungroup() %>%
+  ggplot(aes(x = scat_id, y = taxon_prop, fill = reorder(taxon, -taxon_prop))) +
+  geom_bar(stat = "identity") +
+  facet_grid(cols = vars(region), space = "free", scales = "free") +
+  theme_bw() +
+    theme(
+      legend.key.size = unit(0.4, "cm"),
+      #axis.text.x = element_text(angle = 90, hjust = 0.9),
+      axis.text.x = element_blank(),
+      axis.title.x = element_text(margin = margin(t = 10)),
+      legend.position = "bottom"
+    )  +
+  labs(
+    fill = "",
+    title = "2025 St. Paul Northern Fur Seal diets\nDNA metabarcoding of scats",
+    x = "sample", 
+    y = "proportion of sequencing reads"
+  ) +
+  scale_fill_manual(values = pub_colors) +
+  scale_y_continuous(expand = c(0,0)) +
+  guides(fill = guide_legend(nrow = 5))
+
+ggsave("pdf_outputs/2025_stpaul_filtered_readProp_complex.png", width = 8, height = 5)
+
+```
+
+
+
+
+
+
+
+
+
+
+
