@@ -755,6 +755,21 @@ ggsave("pdf_outputs/2025_stpaul_filtered_readProp_source.png", width = 10, heigh
 
 ```
 
+```{r output-species-for-common-names}
+# filtered_df %>%
+#   ungroup() %>%
+#   select(taxon) %>%
+#   unique() %>%
+#   write_csv("csv_outputs/taxa_names.csv")
+
+# read in data with common names
+common_names <- read_csv("csv_outputs/taxa_w_common_names.csv")
+
+# join those to the filtered df
+
+```
+
+
 ```{r top-species}
 # deal with the duplicate samples from scats
 filtered_df %>%
@@ -792,6 +807,7 @@ Compare the scats across the two areas.
 ```
 
 ```{r}
+# this version of calculating FO doesn't account for the duplicate sample IDs across rookeries...
 n_sample_by_region <- filtered_df %>%
   filter(source != "fecal loop") %>%
   mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East")) %>%
@@ -838,24 +854,6 @@ fo_data <- filtered_df %>%
   mutate(freq = n_samples_per_taxon/n_samples_by_region*100)
 
 
-fo_data %>%
-  ggplot(aes(x = freq, y = reorder(taxon, n_samples_per_taxon), fill = region)) +
-  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
-  theme_minimal() +
-  labs(
-    x = "Frequency of occurrence (%)",
-    y = "",
-    title = "St. Paul - 2025 metabarcoding diets"
-  ) +
-  theme(
-    axis.text.y = element_text(vjust = 0.5),
-    axis.title.x = element_text(margin = margin(t = 5))
-  ) +
-  scale_x_continuous(expand = c(0,0)) +
-  scale_fill_manual(values = c("navyblue", "goldenrod1"))
-
-
-ggsave("pdf_outputs/2025_stpaul_filtered_FO.png", width = 5.5, height = 4)
 ```
 
 But, if we wanted to take into account the relative proportion of the diet items, how might that change things?
@@ -871,6 +869,18 @@ hp <- read_csv("../data/hard_parts/NFS Diet 2025.csv")
 
 # lots of formatting required.
 hp_w_dna <- hp %>%
+  mutate(common_name = case_when(
+    primary == "Gadus" ~ "unid. gadid",
+    primary == "Herring" ~ "Pacific herring",
+    primary == "Pollock" ~ "Walleye pollock",
+    primary == "Salmon" ~ "Salmon sp.",
+    primary == "Sandfish" ~ "Pacific sandfish",
+    primary == "HexSable" ~ "Greenling & sablefish",
+    primary == "Sandlane" ~ "Pacific sandlance",
+    .default = primary
+    
+  )
+           ) %>%
   filter(dna != "no") %>%
   #select(sitename, dna) %>% # the sitename plus dna id is unique.
   #unique() %>%
@@ -878,15 +888,22 @@ hp_w_dna <- hp %>%
            sep = " \\(",
     remove = TRUE) %>%
     mutate(location3 = str_remove(location3, "\\)$"),
-    across(c(loc1, location3), str_to_title))
-
+    across(c(loc1, location3), str_to_title)) %>%
+  mutate(scat_id = paste0(location3,"_",dna)) # create a unique identifier
+  
+tmp1 <- hp_w_dna %>%
+  select(scat_id, keep) %>%
+  unique() %>%
+  mutate(analysis = "hard_parts")
   
 ```
+Why does this have 51 samples? Looks like a couple of fecal loops in there...
 
 
 
 
 ```{r getting-data-oriented-for-ESR}
+# explicitly deal with the scat subsamples
 mb_subsamples <- filtered_df %>%
   ungroup() %>%
   filter(source != "fecal loop") %>%
@@ -924,14 +941,12 @@ mb_subsamples %>%
   scale_fill_manual(values = pub_colors)
 
 
-ggsave("pdf_outputs/2025_stpaul_filtered_readProp_complex.png", width = 8, height = 7)
-  
 ```
 
 
 ```{r}
 # better to take the mean across all replicates and subsamples at the same time!
-filtered_df %>%
+uniq_scat_sample_df <- filtered_df %>%
   ungroup() %>%
   filter(source != "fecal loop") %>%
   separate(alternative_ID, into = c("dna", "subsample"),
@@ -952,12 +967,15 @@ filtered_df %>%
   mutate(region = ifelse(location3 == "Zapadni Reef", "SP English Bay", "SP East")) %>%
   unique() %>%
   ungroup() %>%
-  ggplot(aes(x = scat_id, y = taxon_prop, fill = reorder(taxon, -taxon_prop))) +
+  left_join(., common_names) 
+
+uniq_scat_sample_df %>%
+  ggplot(aes(x = scat_id, y = taxon_prop, fill = reorder(common_name, -taxon_prop))) +
   geom_bar(stat = "identity") +
   facet_grid(cols = vars(region), space = "free", scales = "free") +
   theme_bw() +
     theme(
-      legend.key.size = unit(0.4, "cm"),
+      legend.key.size = unit(0.7, "cm"),
       #axis.text.x = element_text(angle = 90, hjust = 0.9),
       axis.text.x = element_blank(),
       axis.title.x = element_text(margin = margin(t = 10)),
@@ -971,19 +989,111 @@ filtered_df %>%
   ) +
   scale_fill_manual(values = pub_colors) +
   scale_y_continuous(expand = c(0,0)) +
-  guides(fill = guide_legend(nrow = 5))
+  guides(fill = guide_legend(nrow = 4))
 
 ggsave("pdf_outputs/2025_stpaul_filtered_readProp_complex.png", width = 8, height = 5)
 
 ```
 
 
+```{r how-many-scat-samples-per-region?}
+n_scats_per_region <- uniq_scat_sample_df %>%
+  select(region, scat_id) %>%
+  unique() %>%
+  group_by(region) %>%
+  tally(name = "n_scats_region")
+
+```
+35 total scats (excluding fecal loops)
+
+```{r look-at-fo-with-that-df}
+dna_fo_df <- uniq_scat_sample_df %>%
+  group_by(region, common_name) %>%
+  tally() %>%
+  left_join(., n_scats_per_region) %>%
+  mutate(freq = n/n_scats_region, type = "DNA") 
+
+dna_fo_df %>%
+  ggplot(aes(x = freq, y = reorder(common_name, freq), fill = region)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  theme_minimal() +
+  labs(
+    x = "Frequency of occurrence (%)",
+    y = "",
+    title = "St. Paul - 2025 metabarcoding diets"
+  ) +
+  theme(
+    axis.text.y = element_text(vjust = 0.5),
+    axis.title.x = element_text(margin = margin(t = 5))
+  ) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("navyblue", "goldenrod1"))
 
 
+ggsave("pdf_outputs/2025_stpaul_filtered_FO.png", width = 5.5, height = 4)
+```
 
 
+```{r track-samples-for-both-analyses}
+# comparing samples for hard parts that say they were analyzed for DNA with our mb data
+uniq_scat_sample_df %>%
+  select(region, scat_id) %>%
+  unique() %>%
+  full_join(., tmp1) %>%
+  # ignore fecal loop samples because those shouldn't be included ad-hoc
+  filter(!str_detect(scat_id, "ANY")) %>%
+  mutate(dna_analysis = ifelse(is.na(region), "exclude", "keep")) %>%
+  rename(hp_analysis = keep) %>%
+  group_by(hp_analysis, dna_analysis) %>%
+  tally()
+
+```
+Of the samples that were collected for DNA analysis, 14 did not have the minimum data quality required for analysis, 13 of which were also excluded from hard parts results.
 
 
+Now try combining hard parts with metabarcoding data...
+
+```{r first-deal-with-hard-parts-fo}
+n_hp_scats_complex <- hp_w_dna %>%
+  filter(keep != "Exclude") %>%
+  select(complex, scat_id) %>%
+  unique() %>%
+  group_by(complex) %>%
+  tally(name = "n_scats_complex")
+  
+  
+hp_fo_df <- hp_w_dna %>%
+  filter(keep != "Exclude") %>%
+  select(scat_id, complex, common_name, firstgroupname, secondgroupname) %>%
+  group_by(complex, common_name) %>%
+  tally() %>%
+  left_join(., n_hp_scats_complex) %>%
+  mutate(freq = n/n_scats_complex, type = "hard_parts") %>%
+  rename(region = complex) %>%
+  mutate(region = ifelse(region == "East", "SP East", "SP English Bay"))
+  
+# combine dna and hard parts
+dna_fo_df %>%
+  bind_rows(hp_fo_df) %>%
+  ggplot(aes(x = freq, y = reorder(common_name, freq), fill = type)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_grid(cols = vars(region), scales = "free", space = "free") +
+  theme_bw() +
+  labs(
+    x = "Frequency of occurrence (%)",
+    y = "",
+    title = "Northern Fur Seal diet analysis:\nhard parts & DNA metabarcoding"
+  ) +
+  theme(
+    axis.text.y = element_text(vjust = 0.5),
+    axis.title.x = element_text(margin = margin(t = 5))
+  ) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("cornflowerblue","navyblue"))
+
+ggsave("pdf_outputs/2025_stpaul_filtered_FO_comparison.png", width = 6.5, height = 4.5)
+
+```
 
 
 
