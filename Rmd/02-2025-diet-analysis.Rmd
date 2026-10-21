@@ -2,7 +2,7 @@
 title: "02-2025-diet-analysis"
 author: "diana baetscher"
 date: "2026-10-15"
-output: html_document
+output: github_document
 ---
 
 Following the initial bioinformatic analysis in `01-2025-mifish-analysis.Rmd`
@@ -875,8 +875,10 @@ hp_w_dna <- hp %>%
     primary == "Pollock" ~ "Walleye pollock",
     primary == "Salmon" ~ "Salmon sp.",
     primary == "Sandfish" ~ "Pacific sandfish",
-    primary == "HexSable" ~ "Greenling & sablefish",
-    primary == "Sandlane" ~ "Pacific sandlance",
+    firstgroupname == "Pleurogrammus monopterygius/Anoplopoma fimbria" ~ "Atka mackerel or sablefish",
+    primary == "Sandlance" ~ "Pacific sandlance",
+    firstgroupname == "Anoplopoma fimbria" ~ "Sablefish",
+    firstgroupname == "Hexagrammos sp." ~ "Greenling sp.",
     .default = primary
     
   )
@@ -970,7 +972,23 @@ uniq_scat_sample_df <- filtered_df %>%
   left_join(., common_names) 
 
 uniq_scat_sample_df %>%
-  ggplot(aes(x = scat_id, y = taxon_prop, fill = reorder(common_name, -taxon_prop))) +
+    mutate(sp_grp = case_when(
+    common_name == "Pacific herring" ~ 1,
+    common_name == "Walleye pollock" ~ 2,
+    common_name == "Prowfish" ~ 4,
+    common_name == "Salmon sp." ~ 5,
+    common_name == "Chum salmon" ~ 5,
+    common_name == "Chinook salmon" ~ 5,
+    common_name == "Pink salmon" ~ 5,
+    common_name == "Sockeye salmon" ~ 5,
+    common_name == "Kelp greenling" ~ 6,
+    common_name == "Greenling sp." ~ 6,
+    common_name == "Sablefish" ~ 7,
+    .default = 8
+    
+  )
+  ) %>%
+  ggplot(aes(x = scat_id, y = taxon_prop, fill = reorder(common_name, sp_grp))) +
   geom_bar(stat = "identity") +
   facet_grid(cols = vars(region), space = "free", scales = "free") +
   theme_bw() +
@@ -1073,16 +1091,38 @@ hp_fo_df <- hp_w_dna %>%
   mutate(region = ifelse(region == "East", "SP East", "SP English Bay"))
   
 # combine dna and hard parts
-dna_fo_df %>%
+tmp2 <- dna_fo_df %>%
   bind_rows(hp_fo_df) %>%
-  ggplot(aes(x = freq, y = reorder(common_name, freq), fill = type)) +
+  filter(common_name != "Polychaeta") %>%
+  mutate(sp_grp = case_when(
+    common_name == "Pacific herring" ~ 1,
+    common_name == "Walleye pollock" ~ 2,
+    common_name == "unid. gadid" ~ 3,
+    common_name == "Prowfish" ~ 4,
+    common_name == "Salmon sp." ~ 5,
+    common_name == "Chum salmon" ~ 5,
+    common_name == "Chinook salmon" ~ 5,
+    common_name == "Pink salmon" ~ 5,
+    common_name == "Sockeye salmon" ~ 5,
+    common_name == "Kelp greenling" ~ 6,
+    common_name == "Greenling sp." ~ 6,
+    common_name == "Sablefish" ~ 7,
+    common_name == "Atka mackerel or sablefish" ~ 7,
+    .default = 8
+    
+  )
+  )
+
+tmp2 %>%
+  ggplot(aes(x = freq, y = reorder(common_name, -sp_grp), fill = type)) +
   geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
   facet_grid(cols = vars(region), scales = "free", space = "free") +
   theme_bw() +
   labs(
     x = "Frequency of occurrence (%)",
     y = "",
-    title = "Northern Fur Seal diet analysis:\nhard parts & DNA metabarcoding"
+    title = "Northern Fur Seal diet analysis:\nhard parts & DNA metabarcoding",
+    fill = "method"
   ) +
   theme(
     axis.text.y = element_text(vjust = 0.5),
@@ -1095,5 +1135,6 @@ ggsave("pdf_outputs/2025_stpaul_filtered_FO_comparison.png", width = 6.5, height
 
 ```
 
+Now the challenge is that Tonya wants families grouped together... which probably needs to be done manually.
 
 
