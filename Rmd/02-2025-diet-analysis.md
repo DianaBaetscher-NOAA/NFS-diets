@@ -1154,6 +1154,31 @@ clean_df_readDepth_filtered <- clean_df_filtered %>%
     ## ...42, ...43, ...44, prop_taxon)`
 
 ``` r
+clean_df_filtered %>%
+  select(ablg, replicate, total_reads) %>%
+  unique() %>%
+  ggplot(aes(x = reorder(ablg, total_reads), y = total_reads)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = 1000, color = "red") +
+  facet_grid(rows = vars(replicate), labeller = label_both) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, size = 7)
+  ) +
+  labs(
+    x = "DNA sample (scat subsample)"
+  )
+```
+
+    ## Adding missing grouping variables: `sample`
+
+![](02-2025-diet-analysis_files/figure-gfm/remove-samples-with-fewer-than-1000-total-reads-1.png)<!-- -->
+
+``` r
+ggsave("pdf_outputs/2025_stPaul_readDepths.png", width = 8, height = 4)
+```
+
+``` r
 clean_df_readDepth_filtered %>%
   filter(taxon_reads > 10) %>%
  ggplot(aes(x = ablg, y = prop_taxon, fill = taxon)) +
@@ -1400,6 +1425,8 @@ fo_data <- filtered_df %>%
 But, if we wanted to take into account the relative proportion of the
 diet items, how might that change things?
 
+############################# 
+
 ## hard parts data
 
 To compare sample-to-sample
@@ -1562,7 +1589,7 @@ uniq_scat_sample_df %>%
   guides(fill = guide_legend(nrow = 4))
 ```
 
-![](02-2025-diet-analysis_files/figure-gfm/unnamed-chunk-13-1.png)<!-- -->
+![](02-2025-diet-analysis_files/figure-gfm/unnamed-chunk-12-1.png)<!-- -->
 
 ``` r
 ggsave("pdf_outputs/2025_stpaul_filtered_readProp_complex.png", width = 8, height = 5)
@@ -1641,6 +1668,33 @@ Of the samples that were collected for DNA analysis, 14 did not have the
 minimum data quality required for analysis, 13 of which were also
 excluded from hard parts results.
 
+For the hard parts “exclude” category, there are two samples that likely
+should have DNA because they were excluded because of unidentifiable
+bones. Try looking more closely at the individual scats…
+
+``` r
+hp_grps <- hp_w_dna %>%
+  select(scat_id, keep, firstgroupname) %>%
+  unique() %>%
+  mutate(analysis = "hard_parts") 
+
+uniq_scat_sample_df %>%
+  select(region, scat_id) %>%
+  unique() %>%
+  full_join(., hp_grps) %>%
+   # ignore fecal loop samples because those shouldn't be included ad-hoc
+  filter(!str_detect(scat_id, "ANY")) %>%
+  mutate(dna_analysis = ifelse(is.na(region), "exclude", "keep")) %>%
+  select(-region) %>%
+  rename(hp_analysis = keep) %>%
+  mutate(hp_notes = ifelse(hp_analysis == "Exclude", firstgroupname, NA)) %>%
+  select(-firstgroupname) %>%
+  unique() %>%
+  write_csv("csv_outputs/2025_stPaul_sampleTracking.csv")
+```
+
+    ## Joining with `by = join_by(scat_id)`
+
 Now try combining hard parts with metabarcoding data…
 
 ``` r
@@ -1660,7 +1714,8 @@ hp_fo_df <- hp_w_dna %>%
   left_join(., n_hp_scats_complex) %>%
   mutate(freq = n/n_scats_complex, type = "hard_parts") %>%
   rename(region = complex) %>%
-  mutate(region = ifelse(region == "East", "SP East", "SP English Bay"))
+  mutate(region = ifelse(region == "East", "SP East", "SP English Bay")) %>%
+  rename(n_scats_region = n_scats_complex)
 ```
 
     ## Joining with `by = join_by(complex)`
@@ -1704,7 +1759,7 @@ tmp2 %>%
     axis.text.y = element_text(vjust = 0.5),
     axis.title.x = element_text(margin = margin(t = 5))
   ) +
-  scale_x_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), limits = c(0,1), labels = c(0, 0.25, 0.5, 0.75, 1.0)) +
   scale_fill_manual(values = c("cornflowerblue","navyblue"))
 ```
 
@@ -1716,3 +1771,96 @@ ggsave("pdf_outputs/2025_stpaul_filtered_FO_comparison.png", width = 6.5, height
 
 Now the challenge is that Tonya wants families grouped together… which
 probably needs to be done manually.
+
+``` r
+tmp2 %>%
+  write_csv("csv_outputs/2025_stPaul_FO_both_methods.csv")
+```
+
+``` r
+uniq_scat_sample_df %>%
+  select(region, scat_id) %>%
+  unique() %>%
+  full_join(., hp_grps) %>%
+   # ignore fecal loop samples because those shouldn't be included ad-hoc
+  filter(!str_detect(scat_id, "ANY")) %>%
+  mutate(dna_analysis = ifelse(is.na(region), "exclude", "keep")) %>%
+  select(-region) %>%
+  rename(hp_analysis = keep) %>%
+  mutate(hp_notes = ifelse(hp_analysis == "Exclude", firstgroupname, NA)) %>%
+  select(-firstgroupname) %>%
+  unique() %>%
+  mutate(analyzed = ifelse(hp_analysis == "Keep" | dna_analysis == "keep", "yes", "no")) %>%
+  filter(analyzed == "yes") %>%
+  select(scat_id) %>%
+  unique() %>%
+  separate(scat_id, into = c("rookery", "sample"))
+```
+
+    ## Joining with `by = join_by(scat_id)`
+
+    ## Warning: Expected 2 pieces. Additional pieces discarded in 36 rows [1, 2, 3, 4, 5, 6, 7,
+    ## 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, ...].
+
+    ## # A tibble: 36 × 2
+    ##    rookery sample
+    ##    <chr>   <chr> 
+    ##  1 Zapadni Reef  
+    ##  2 Zapadni Reef  
+    ##  3 Zapadni Reef  
+    ##  4 Zapadni Reef  
+    ##  5 Zapadni Reef  
+    ##  6 Zapadni Reef  
+    ##  7 Zapadni Reef  
+    ##  8 Zapadni Reef  
+    ##  9 Zapadni Reef  
+    ## 10 Zapadni Reef  
+    ## # ℹ 26 more rows
+
+Katie made some edits to help sort through any confusion with the number
+of samples and has included them here:
+
+``` r
+checks <- read_csv("../data/hard_parts/2025_stPaul_sampleTracking_rev.csv")
+```
+
+    ## Rows: 49 Columns: 6
+    ## ── Column specification ────────────────────────────────────────────────────────
+    ## Delimiter: ","
+    ## chr (6): scat_id, dna_analysis, hp_analysis, hp_notes, method, analysis
+    ## 
+    ## ℹ Use `spec()` to retrieve the full column specification for this data.
+    ## ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+
+``` r
+checks %>%
+  group_by(method) %>%
+  tally()
+```
+
+    ## # A tibble: 4 × 2
+    ##   method      n
+    ##   <chr>   <int>
+    ## 1 both       33
+    ## 2 dna         2
+    ## 3 hp          1
+    ## 4 neither    13
+
+``` r
+checks %>%
+  mutate(complex = ifelse(str_detect(scat_id, "Zapadni"), "English Bay", "East")) %>%
+  group_by(complex, method) %>%
+  tally()
+```
+
+    ## # A tibble: 7 × 3
+    ## # Groups:   complex [2]
+    ##   complex     method      n
+    ##   <chr>       <chr>   <int>
+    ## 1 East        both       21
+    ## 2 East        dna         1
+    ## 3 East        hp          1
+    ## 4 East        neither    10
+    ## 5 English Bay both       12
+    ## 6 English Bay dna         1
+    ## 7 English Bay neither     3
